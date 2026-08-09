@@ -13,6 +13,59 @@ health/metrics.
 
 ## Wiring
 
+Two wiring shapes are supported. Prefer the **app-owned** shape (demoapp
+golden path): `main` declares only the chassis (resend alongside postgres /
+valkey) and the app class; product machinery that sends email lives under the
+app and resolves resend as a peer at `Init`. Use the simple `main`-level shape
+for one-off binaries.
+
+### App-owned consumer (golden — demoapp pattern)
+
+`main` declares resend as chassis and runs the app class; it never touches
+resend itself:
+
+```go
+fw := cf.New(&cf.FrameworkOptions{
+	Logs: &cf.LogsSettings{Format: "json", Level: "info", ConfigSource: "logs"},
+	Observability: &cf.ObservabilitySettings{Address: ":9090", ConfigSource: "observability"},
+	Components: []cf.CaerusComponent{
+		cf_postgres.New(cf_postgres.WithConfigSource("postgresql", "config/postgresql.json")),
+		cf_resend.New(cf_resend.WithConfigSource("resend", "config/resend.json")),
+		app.New(app.Options{}),
+	},
+})
+if err := fw.RunWithSignals(context.Background()); err != nil {
+	log.Fatal(err)
+}
+```
+
+The app resolves the resend **component pointer** once at `Init` (never a
+client snapshot), declares it in `GetDependencies`, and calls `Send` per use:
+
+```go
+type App struct {
+	email *cf_resend.CFResend
+}
+
+func (a *App) GetDependencies() []string {
+	return []string{cf_resend.ComponentName} // + logs, chassis peers
+}
+
+func (a *App) Init(ctx context.Context, fw *cf.CaerusFramework) error {
+	email, ok := cf.Get[*cf_resend.CFResend](fw)
+	if !ok {
+		return errors.New("app: resend component missing")
+	}
+	a.email = email
+	return nil
+}
+```
+
+### Simple `main`-level wiring
+
+For a one-off binary, register the components directly and use
+`cf.MustGet` to reach the component:
+
 ```go
 fw := cf.New()
 
@@ -22,21 +75,25 @@ fw.AddComponent(logs)
 fw.AddComponent(resend) // GetDependencies() -> [logs configuration]
 ```
 
-The component is `cf.ConfigSourceRegistrar`-self-sufficient: `WithConfigSource`
-registers the `Source[ResendConfig]` with the configuration component during
-argv absorption, so `main` never touches `os.Getenv`/`ParseFlags`. The `--resend`
-path flag and per-field flags come from the source declaration.
+In both shapes the component is `cf.ConfigSourceRegistrar`-self-sufficient:
+`WithConfigSource` registers the `Source[ResendConfig]` with the configuration
+component during argv absorption, so `main` never touches
+`os.Getenv`/`ParseFlags`. The `--resend` path flag and per-field flags come from
+the source declaration.
 
 ## Sending
 
 `Send` fills `From` from the configured `from_address` when the request leaves
 it empty, requires at least one recipient, and honors the context end-to-end
-(`Emails.SendWithContext`):
+(`Emails.SendWithContext`). The app resolves the component once at `Init` (see
+Wiring above) and sends per use:
 
 ```go
-resend := cf.MustGet[*cf_resend.CFResend](fw)
+// in the app's Init — store the component pointer
+a.email, _ = cf.Get[*cf_resend.CFResend](fw)
 
-resp, err := resend.Send(ctx, &resendv2.SendEmailRequest{
+// per use
+resp, err := a.email.Send(ctx, &resend.SendEmailRequest{
 	To:      []string{"user@example.com"},
 	Subject: "Welcome",
 	Html:    "<p>Hi!</p>",
