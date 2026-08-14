@@ -126,14 +126,15 @@ Load `ResendConfig` through the configuration component. The default
 
 ```json
 {
-  "api_key": "re_...",
+  "api_key": "…",
   "from_address": "noreply@example.com"
 }
 ```
 
 **Files are canonical in Kubernetes**, including the API key — mount a
 Secret/ConfigMap and let `fsnotify` + `OnConfigReload` rotate the client without
-a restart. On reload failure the previous client stays live (last-good). Resend
+a restart. `api_key` is tagged `secret:"redact"`: reload logs `api_key_set`,
+never the key. Do not log the config struct. On reload failure the previous client stays live (last-good). Resend
 is a stateless HTTP wrapper, so `Client()` and `Send` keep working through a
 swap.
 

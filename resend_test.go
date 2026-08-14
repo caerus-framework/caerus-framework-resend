@@ -1,9 +1,11 @@
 package cf_resend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -556,6 +558,23 @@ func TestReloadLastGoodKeepsPreviousClient(t *testing.T) {
 	}
 	if n := r.reloads.Load(); n != 0 {
 		t.Fatalf("reloads = %d, want 0", n)
+	}
+}
+
+func TestResendConfigLogArgsNeverCleartext(t *testing.T) {
+	cfg := ResendConfig{APIKey: "re_live_s3cret", FromAddress: "noreply@example.com"}
+	var buf bytes.Buffer
+	l := slog.New(slog.NewTextHandler(&buf, nil))
+	l.Info("summary", cf_configuration.LogArgs(cfg)...)
+	out := buf.String()
+	if strings.Contains(out, "re_live_s3cret") {
+		t.Fatalf("api_key leaked: %s", out)
+	}
+	if !strings.Contains(out, "[redacted]") {
+		t.Fatalf("want [redacted] in %s", out)
+	}
+	if !strings.Contains(out, "from_address=noreply@example.com") {
+		t.Fatalf("from_address should stay visible: %s", out)
 	}
 }
 

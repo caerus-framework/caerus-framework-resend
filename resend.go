@@ -38,7 +38,7 @@ const (
 // WithConfigSource; both JSON and YAML tags are provided.
 type ResendConfig struct {
 	// APIKey is the Resend API key (resend.com, or a self-hosted instance).
-	APIKey string `json:"api_key" yaml:"api_key" env:"API_KEY"`
+	APIKey string `json:"api_key" yaml:"api_key" env:"API_KEY" secret:"redact"`
 	// FromAddress is the default sender address (e.g. "noreply@example.com").
 	// Send leaves it to the caller when the request carries its own From.
 	FromAddress string `json:"from_address" yaml:"from_address" env:"FROM_ADDRESS"`
@@ -304,7 +304,10 @@ func (c *CFResend) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 		return err
 	}
 	c.client = client
-	c.logger.Info("cf_resend: initialized", "from", c.from)
+	c.logger.Info("cf_resend: initialized",
+		"from", c.from,
+		cf_logs.SecretSet("api_key", c.apiKey),
+	)
 	return nil
 }
 
@@ -464,7 +467,10 @@ func (c *CFResend) OnConfigReload(source string, cfg any) {
 	}
 	c.client = newClient
 	c.reloads.Add(1)
-	c.logger.Info("cf_resend: reconfigured after config reload", "from", c.from)
+	c.logger.Info("cf_resend: reconfigured after config reload",
+		"from", c.from,
+		cf_logs.SecretSet("api_key", c.apiKey),
+	)
 }
 
 // RegisterConfigSources implements cf.ConfigSourceRegistrar. The framework
