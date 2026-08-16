@@ -39,8 +39,8 @@ const (
 type ResendConfig struct {
 	// APIKey is the Resend API key (resend.com, or a self-hosted instance).
 	APIKey string `json:"api_key" yaml:"api_key" env:"API_KEY" secret:"redact"`
-	// FromAddress is the default sender address (e.g. "noreply@example.com").
-	// Send leaves it to the caller when the request carries its own From.
+	// FromAddress is the soft-default sender (e.g. "noreply@example.com"
+	// or `Name <noreply@example.com>`). Send uses it when Mail.From is empty.
 	FromAddress string `json:"from_address" yaml:"from_address" env:"FROM_ADDRESS"`
 	// BaseURL overrides the Resend API endpoint. Empty uses the SDK default.
 	// Useful for self-hosted instances or tests that stub the API.
@@ -138,7 +138,9 @@ func WithAPIKey(apiKey string) Option {
 	return func(o *options) { o.apiKey = apiKey }
 }
 
-// WithFromAddress sets the default sender address.
+// WithFromAddress sets the soft-default sender. Send uses it when Mail.From
+// is empty. A non-empty Mail.From overrides this call only. Both empty, or
+// a value that does not parse as an email address, is an error.
 func WithFromAddress(from string) Option {
 	return func(o *options) { o.fromAddress = from }
 }
@@ -296,7 +298,7 @@ func (c *CFResend) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	}
 
 	if c.from == "" {
-		c.logger.Warn("cf_resend: no from_address configured; Send calls must provide From")
+		c.logger.Warn("cf_resend: no from_address configured; Send must set Mail.From")
 	}
 
 	client, err := c.buildClient()
@@ -380,10 +382,22 @@ type senderStats struct {
 	failed        map[string]uint64 // error_code -> count
 	durationSum   float64           // total send latency in seconds
 	durationCount uint64
+	retries       uint64
 }
 
 func newSendMeter() *sendMeter {
 	return &sendMeter{senders: make(map[string]*senderStats)}
+}
+
+func (m *sendMeter) addRetry(from string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.senders[from]
+	if s == nil {
+		s = &senderStats{failed: make(map[string]uint64)}
+		m.senders[from] = s
+	}
+	s.retries++
 }
 
 // snapshot returns a point-in-time copy of the meter for Metrics.
@@ -396,7 +410,7 @@ func (m *sendMeter) snapshot() map[string]senderStats {
 		for code, n := range s.failed {
 			failed[code] = n
 		}
-		out[from] = senderStats{sent: s.sent, failed: failed, durationSum: s.durationSum, durationCount: s.durationCount}
+		out[from] = senderStats{sent: s.sent, failed: failed, durationSum: s.durationSum, durationCount: s.durationCount, retries: s.retries}
 	}
 	return out
 }
@@ -422,6 +436,15 @@ func (t *meterTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	resp, err := base.RoundTrip(req)
 	d := time.Since(start).Seconds()
+	if slot, ok := req.Context().Value(httpStatusKey{}).(*httpStatusSlot); ok && slot != nil {
+		if err != nil {
+			slot.code = 0
+			slot.retryAfter = ""
+		} else if resp != nil {
+			slot.code = resp.StatusCode
+			slot.retryAfter = resp.Header.Get("Retry-After")
+		}
+	}
 	t.meter.mu.Lock()
 	s := t.meter.senders[from]
 	if s == nil {
@@ -524,8 +547,8 @@ func (c *CFResend) Client() *resend.Client {
 	return c.client
 }
 
-// From returns the configured default sender address (may be empty; then Send
-// calls must carry their own From).
+// From returns the configured soft-default sender (from_address /
+// WithFromAddress). Empty means every Send must set Mail.From.
 func (c *CFResend) From() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -539,32 +562,79 @@ func (c *CFResend) BaseURL() string {
 	return c.baseURL
 }
 
-// Send sends an email through Resend. When req.From is empty the component's
-// configured FromAddress is used; an empty final From is an error. The context
-// is honored end-to-end (the SDK's SendWithContext). The caller's request is
-// not mutated. Send traffic metrics are attributed to the resolved sender via
-// the context; sends made directly through Client().Emails (bypassing Send)
-// are attributed to "unknown".
-func (c *CFResend) Send(ctx context.Context, req *resend.SendEmailRequest) (*resend.SendEmailResponse, error) {
+// Send sends m through Resend and returns the provider message id.
+//
+// From: from_address / WithFromAddress is a soft default when Mail.From is
+// empty. If both are empty, or the resolved From or any To address does not
+// parse (`net/mail.ParseAddress`), Send fails. HTML and Text may both be set;
+// at least one must be non-empty.
+//
+// If the first HTTP status is 429 or 5xx, Send waits (Retry-After, capped at
+// 1s) and tries once more while ctx is live. 4xx other than 429 and network
+// errors are not retried.
+func (c *CFResend) Send(ctx context.Context, m Mail) (string, error) {
 	client := c.Client()
 	if client == nil {
-		return nil, errors.New("cf_resend: Send before Init or after Shutdown")
+		return "", errors.New("cf_resend: Send before Init or after Shutdown")
 	}
-	if req == nil {
-		return nil, errors.New("cf_resend: nil SendEmailRequest")
+	from, err := resolveFrom(m.From, c.From())
+	if err != nil {
+		return "", err
 	}
-	r := *req
-	if r.From == "" {
-		r.From = c.From()
+	to, err := validateTo(m.To)
+	if err != nil {
+		return "", err
 	}
-	if r.From == "" {
-		return nil, errors.New("cf_resend: no From configured (set from_address or req.From)")
+	m.To = to
+	if reply := strings.TrimSpace(m.ReplyTo); reply != "" {
+		if err := validateMailbox("ReplyTo", reply); err != nil {
+			return "", err
+		}
+		m.ReplyTo = reply
 	}
-	if len(r.To) == 0 {
-		return nil, errors.New("cf_resend: SendEmailRequest.To is empty")
+	if m.HTML == "" && m.Text == "" {
+		return "", errors.New("cf_resend: Mail needs HTML or Text")
 	}
-	sendCtx := context.WithValue(ctx, fromCtxKey{}, r.From)
-	return client.Emails.SendWithContext(sendCtx, &r)
+	req := m.toSDK(from)
+	id, err, slot := c.sendOnce(ctx, client, from, m, req)
+	if err == nil {
+		return id, nil
+	}
+	if !shouldRetryStatus(slot.code) {
+		return "", err
+	}
+	if waitErr := waitRetry(ctx, retryWaitDuration(slot.retryAfter)); waitErr != nil {
+		return "", err
+	}
+	c.meter.addRetry(from)
+	client = c.Client()
+	if client == nil {
+		return "", err
+	}
+	id, err, _ = c.sendOnce(ctx, client, from, m, req)
+	return id, err
+}
+
+func (c *CFResend) sendOnce(ctx context.Context, client *resend.Client, from string, m Mail, req *resend.SendEmailRequest) (string, error, httpStatusSlot) {
+	slot := &httpStatusSlot{}
+	sendCtx := context.WithValue(ctx, fromCtxKey{}, from)
+	sendCtx = context.WithValue(sendCtx, httpStatusKey{}, slot)
+	var (
+		resp *resend.SendEmailResponse
+		err  error
+	)
+	if m.IdempotencyKey != "" {
+		resp, err = client.Emails.SendWithOptions(sendCtx, req, &resend.SendEmailOptions{IdempotencyKey: m.IdempotencyKey})
+	} else {
+		resp, err = client.Emails.SendWithContext(sendCtx, req)
+	}
+	if err != nil {
+		return "", &SendError{err: err, status: slot.code}, *slot
+	}
+	if resp == nil {
+		return "", errors.New("cf_resend: empty send response"), *slot
+	}
+	return resp.Id, nil, *slot
 }
 
 // Health implements cf.HealthProvider. Resend exposes no liveness endpoint, so
@@ -654,6 +724,13 @@ func (c *CFResend) trafficMetrics(ms []cf_observability.Metric, from string, s s
 			Name:   "resend_send_duration_seconds_count",
 			Help:   "Total number of Resend send attempts (2xx and failures).",
 			Value:  float64(s.durationCount),
+			Labels: copyLabels(labels),
+			Type:   cf_observability.MetricTypeCounter,
+		},
+		cf_observability.Metric{
+			Name:   "resend_send_retries_total",
+			Help:   "Total number of second Send attempts after HTTP 429 or 5xx.",
+			Value:  float64(s.retries),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
 		},

@@ -83,20 +83,42 @@ the source declaration.
 
 ## Sending
 
-`Send` fills `From` from the configured `from_address` when the request leaves
-it empty, requires at least one recipient, and honors the context end-to-end
-(`Emails.SendWithContext`). The app resolves the component once at `Init` (see
-Wiring above) and sends per use:
+`Send` takes a Caerus `Mail` value (SES-simple: From, To, Subject, HTML/Text,
+ReplyTo, Tags, optional IdempotencyKey). Apps do **not** import resend-go for
+ordinary mail. One extra attempt runs on HTTP **429** or **5xx** (honor
+`Retry-After`, wait capped at 1s, stop if `ctx` is done). 422 and network
+errors are not retried.
+
+**From:** `from_address` / `WithFromAddress` is a **soft default**. Empty
+`Mail.From` uses it. Non-empty `Mail.From` overrides that send. If both are
+empty, or the resolved address or any `To` does not parse as an email
+(`net/mail.ParseAddress`), Send fails. At least one of HTML or Text is required.
+
+Attachments, Cc/Bcc, and scheduled send stay on `Client()` (that path
+imports the SDK on purpose).
 
 ```go
 // in the app's Init — store the component pointer
 a.email, _ = cf.Get[*cf_resend.CFResend](fw)
 
-// per use
-resp, err := a.email.Send(ctx, &resend.SendEmailRequest{
+id, err := a.email.Send(ctx, cf_resend.Mail{
 	To:      []string{"user@example.com"},
 	Subject: "Welcome",
-	Html:    "<p>Hi!</p>",
+	HTML:    "<p>Hi!</p>",
+})
+if err != nil {
+	if cf_resend.HTTPStatus(err) == 429 {
+		// rate limited
+	}
+	return err
+}
+
+// per-call From override
+id, err = a.email.Send(ctx, cf_resend.Mail{
+	From:    "brand@example.com",
+	To:      []string{"user@example.com"},
+	Subject: "Welcome",
+	Text:    "Hi",
 })
 ```
 
@@ -111,7 +133,7 @@ client, since config reload swaps it.
 | `WithConfig(ResendConfig)` | static config snapshot; non-zero fields override option-set defaults |
 | `WithConfigSource(name, path, …)` | bind a configuration source for Init + `OnConfigReload`; the module registers the `Source[ResendConfig]` itself (declares `configuration` dep) |
 | `WithAPIKey(key)` | set the Resend API key directly (tests, embedded use) |
-| `WithFromAddress(from)` | default sender address |
+| `WithFromAddress(from)` | soft-default sender; empty `Mail.From` uses it; must be a valid address when used |
 | `WithBaseURL(url)` | override the Resend API endpoint (self-hosted / test stub) |
 | `WithTimeout(d)` | per-send HTTP timeout (default `10s`) |
 | `WithHTTPClient(*http.Client)` | override the HTTP client (stub RoundTripper in tests) |
@@ -147,7 +169,7 @@ initialized, nil before Init/after Shutdown:
 | `resend_info` | gauge 1 | `component`, `from`, `base_url` |
 | `resend_config_reloads_total` | counter | `component` |
 | `resend_emails_sent_total` | counter | `component`, `from` |
-| `resend_emails_failed_total` | counter | `component`, `from`, `error_code` |
+| `resend_send_retries_total` | counter | `component`, `from` |
 | `resend_send_duration_seconds_sum` | counter | `component`, `from` |
 | `resend_send_duration_seconds_count` | counter | `component`, `from` |
 
@@ -155,7 +177,10 @@ initialized, nil before Init/after Shutdown:
 its labels always reflect the live configured sender identity. Error codes are
 the real HTTP statuses (e.g. `429`, `422`, `500`), or `network` for transport
 errors — recorded at the transport layer because the resend SDK swallows status
-codes in its errors. Average send latency is
+codes in its errors. `Send` wraps those failures as `*SendError`:
+`cf_resend.HTTPStatus(err)` is the same number (0 = network / never an HTTP
+response). `errors.As` to `*SendError` works. Direct `Client().Emails` calls
+are not wrapped. Average send latency is
 `resend_send_duration_seconds_sum / resend_send_duration_seconds_count`; the
 send error rate is
 `rate(resend_emails_failed_total[5m]) / rate(resend_emails_sent_total[5m])`
