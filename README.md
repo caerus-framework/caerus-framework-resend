@@ -27,7 +27,7 @@ resend itself:
 ```go
 fw := cf.New(&cf.FrameworkOptions{
 	Logs: &cf.LogsSettings{Format: "json", Level: "info", ConfigSource: "logs"},
-	Observability: &cf.ObservabilitySettings{Address: ":9090", ConfigSource: "observability"},
+	Observability: &cf.ObservabilitySettings{Bind: ":9090", ConfigSource: "observability"},
 	Components: []cf.CaerusComponent{
 		cf_postgres.New(cf_postgres.WithConfigSource("postgresql", "config/postgresql.json")),
 		cf_resend.New(cf_resend.WithConfigSource("resend", "config/resend.json")),
