@@ -3,10 +3,10 @@ module github.com/caerus-framework/caerus-framework-resend
 go 1.26
 
 require (
-	github.com/caerus-framework/caerus-framework v0.0.9
-	github.com/caerus-framework/caerus-framework-configuration v0.0.8
-	github.com/caerus-framework/caerus-framework-logs v0.0.7
-	github.com/caerus-framework/caerus-framework-observability v0.0.6
+	github.com/caerus-framework/caerus-framework v0.0.10
+	github.com/caerus-framework/caerus-framework-configuration v0.0.9
+	github.com/caerus-framework/caerus-framework-logs v0.0.8
+	github.com/caerus-framework/caerus-framework-observability v0.0.7
 	github.com/resend/resend-go/v2 v2.28.0
 )
 
