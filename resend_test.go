@@ -17,8 +17,11 @@ import (
 	cf_configuration "github.com/caerus-framework/caerus-framework-configuration"
 	cf_logs "github.com/caerus-framework/caerus-framework-logs"
 	cf_observability "github.com/caerus-framework/caerus-framework-observability"
-	"github.com/resend/resend-go/v2"
 )
+
+func testMail(to string) Mail {
+	return Mail{To: []string{to}, Subject: "t", Text: "t"}
+}
 
 func TestComponentContract(t *testing.T) {
 	r := New()
@@ -118,20 +121,37 @@ func TestInitTwiceIsIdempotent(t *testing.T) {
 // stubRoundTripper captures the last request and returns a canned response.
 type stubRoundTripper struct {
 	lastReq *http.Request
+	calls   int
 	body    string
 	code    int
+	header  http.Header
 	err     error
+	bodies  []string
+	codes   []int
 }
 
 func (s *stubRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	s.calls++
 	s.lastReq = r
 	if s.err != nil {
 		return nil, s.err
 	}
+	i := s.calls - 1
+	code, body := s.code, s.body
+	if i < len(s.codes) {
+		code = s.codes[i]
+	}
+	if i < len(s.bodies) {
+		body = s.bodies[i]
+	}
+	hdr := http.Header{"Content-Type": []string{"application/json"}}
+	if s.header != nil {
+		hdr = s.header.Clone()
+	}
 	return &http.Response{
-		StatusCode: s.code,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(s.body)),
+		StatusCode: code,
+		Header:     hdr,
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}, nil
 }
 
@@ -144,16 +164,16 @@ func TestSendUsesConfiguredFrom(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
-	resp, err := r.Send(context.Background(), &resend.SendEmailRequest{
+	id, err := r.Send(context.Background(), Mail{
 		To:      []string{"user@example.com"},
 		Subject: "hi",
-		Html:    "<p>hi</p>",
+		HTML:    "<p>hi</p>",
 	})
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if resp == nil || resp.Id != "email_1" {
-		t.Fatalf("resp = %+v, want id email_1", resp)
+	if id != "email_1" {
+		t.Fatalf("id = %q, want email_1", id)
 	}
 	if stub.lastReq == nil {
 		t.Fatal("no request captured")
@@ -176,15 +196,34 @@ func TestSendRequestFromWins(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
-	req := &resend.SendEmailRequest{
+	m := Mail{
 		From: "override@x.io",
 		To:   []string{"user@example.com"},
+		Text: "hi",
 	}
-	if _, err := r.Send(context.Background(), req); err != nil {
+	if _, err := r.Send(context.Background(), m); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if req.From != "override@x.io" {
-		t.Fatal("caller's request should not be mutated")
+	if m.From != "override@x.io" {
+		t.Fatal("caller's Mail should not be mutated")
+	}
+}
+
+func TestSendIdempotencyKey(t *testing.T) {
+	stub := &stubRoundTripper{body: `{"id":"email_1"}`, code: 200}
+	r := New(WithAPIKey("re_key"), WithFromAddress("noreply@x.io"),
+		WithHTTPClient(&http.Client{Transport: stub}))
+	if err := r.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
+	m := testMail("a@x.io")
+	m.IdempotencyKey = "req-1"
+	if _, err := r.Send(context.Background(), m); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if stub.lastReq.Header.Get("Idempotency-Key") != "req-1" {
+		t.Fatalf("Idempotency-Key = %q", stub.lastReq.Header.Get("Idempotency-Key"))
 	}
 }
 
@@ -192,7 +231,7 @@ func TestSendErrors(t *testing.T) {
 	r := New(WithAPIKey("re_key"), WithFromAddress("noreply@x.io"))
 	ctx := context.Background()
 
-	if _, err := r.Send(ctx, &resend.SendEmailRequest{To: []string{"a@x.io"}}); err == nil {
+	if _, err := r.Send(ctx, testMail("a@x.io")); err == nil {
 		t.Fatal("Send before Init should fail")
 	}
 	if err := r.Init(ctx, cf.New()); err != nil {
@@ -200,19 +239,30 @@ func TestSendErrors(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Shutdown(ctx) })
 
-	if _, err := r.Send(ctx, nil); err == nil {
-		t.Fatal("nil request should fail")
+	if _, err := r.Send(ctx, Mail{}); err == nil {
+		t.Fatal("empty Mail should fail")
+	} else if HTTPStatus(err) != 0 {
+		t.Fatalf("validation error should not look like HTTP: %v", err)
 	}
 	noFrom := New(WithAPIKey("re_key"))
 	if err := noFrom.Init(ctx, cf.New()); err != nil {
 		t.Fatalf("Init(noFrom): %v", err)
 	}
 	t.Cleanup(func() { _ = noFrom.Shutdown(ctx) })
-	if _, err := noFrom.Send(ctx, &resend.SendEmailRequest{To: []string{"a@x.io"}}); err == nil {
-		t.Fatal("Send with no configured from and no req.From should fail")
+	if _, err := noFrom.Send(ctx, testMail("a@x.io")); err == nil {
+		t.Fatal("Send with no from_address and no Mail.From should fail")
 	}
-	if _, err := r.Send(ctx, &resend.SendEmailRequest{From: "a@x.io"}); err == nil {
+	if _, err := r.Send(ctx, Mail{From: "not-an-email", To: []string{"a@x.io"}, Text: "hi"}); err == nil {
+		t.Fatal("invalid Mail.From should fail")
+	}
+	if _, err := r.Send(ctx, Mail{From: "a@x.io", To: []string{"not-an-email"}, Text: "hi"}); err == nil {
+		t.Fatal("invalid Mail.To should fail")
+	}
+	if _, err := r.Send(ctx, Mail{From: "a@x.io", Text: "hi"}); err == nil {
 		t.Fatal("Send with no To should fail")
+	}
+	if _, err := r.Send(ctx, Mail{From: "a@x.io", To: []string{"a@x.io"}, Subject: "x"}); err == nil {
+		t.Fatal("Send with no HTML or Text should fail")
 	}
 }
 
@@ -298,7 +348,7 @@ func TestSendTrafficCounters(t *testing.T) {
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
 	for i := 0; i < 3; i++ {
-		if _, err := r.Send(context.Background(), &resend.SendEmailRequest{To: []string{"a@x.io"}}); err != nil {
+		if _, err := r.Send(context.Background(), testMail("a@x.io")); err != nil {
 			t.Fatalf("Send %d: %v", i, err)
 		}
 	}
@@ -319,7 +369,11 @@ func TestSendTrafficCounters(t *testing.T) {
 }
 
 func TestSendFailureCounters(t *testing.T) {
-	stub := &stubRoundTripper{body: `{"message":"rate limited"}`, code: 429}
+	stub := &stubRoundTripper{
+		body:   `{"message":"rate limited"}`,
+		code:   429,
+		header: http.Header{"Retry-After": []string{"0"}},
+	}
 	r := New(WithAPIKey("re_key"), WithFromAddress("noreply@x.io"),
 		WithHTTPClient(&http.Client{Transport: stub}))
 	if err := r.Init(context.Background(), cf.New()); err != nil {
@@ -327,11 +381,16 @@ func TestSendFailureCounters(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
-	if _, err := r.Send(context.Background(), &resend.SendEmailRequest{To: []string{"a@x.io"}}); err == nil {
+	if _, err := r.Send(context.Background(), testMail("a@x.io")); err == nil {
 		t.Fatal("Send should fail on 429")
+	} else if HTTPStatus(err) != 429 {
+		t.Fatalf("HTTPStatus = %d, want 429 (%v)", HTTPStatus(err), err)
 	}
-	if _, err := r.Send(context.Background(), &resend.SendEmailRequest{To: []string{"b@x.io"}}); err == nil {
+	var se *SendError
+	if _, err := r.Send(context.Background(), testMail("b@x.io")); err == nil {
 		t.Fatal("Send should fail on 429")
+	} else if !errors.As(err, &se) || se.HTTPStatus() != 429 {
+		t.Fatalf("errors.As SendError: %v", err)
 	}
 
 	base := map[string]string{"from": "noreply@x.io", "component": "resend"}
@@ -339,10 +398,95 @@ func TestSendFailureCounters(t *testing.T) {
 		t.Fatalf("sent = %+v, want value 0 (counter emitted zero until first fire)", m)
 	}
 	rateLimit := map[string]string{"from": "noreply@x.io", "component": "resend", "error_code": "429"}
-	if m := findMetric(t, r.Metrics(), "resend_emails_failed_total", rateLimit); m == nil || m.Value != 2 {
-		t.Fatalf("failed 429 = %+v, want value 2", m)
+	if m := findMetric(t, r.Metrics(), "resend_emails_failed_total", rateLimit); m == nil || m.Value != 4 {
+		t.Fatalf("failed 429 = %+v, want value 4 (two Send calls × two attempts)", m)
+	}
+	if m := findMetric(t, r.Metrics(), "resend_send_retries_total", base); m == nil || m.Value != 2 {
+		t.Fatalf("retries = %+v, want value 2", m)
+	}
+	if stub.calls != 4 {
+		t.Fatalf("HTTP calls = %d, want 4", stub.calls)
 	}
 }
+
+func TestSendRetries429ThenOK(t *testing.T) {
+	stub := &stubRoundTripper{
+		codes:  []int{429, 200},
+		bodies: []string{`{"message":"rate limited"}`, `{"id":"email_2"}`},
+		header: http.Header{"Retry-After": []string{"0"}},
+	}
+	r := New(WithAPIKey("re_key"), WithFromAddress("noreply@x.io"),
+		WithHTTPClient(&http.Client{Transport: stub}))
+	if err := r.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
+	id, err := r.Send(context.Background(), testMail("a@x.io"))
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if id != "email_2" {
+		t.Fatalf("id = %q", id)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("calls = %d, want 2", stub.calls)
+	}
+	base := map[string]string{"from": "noreply@x.io", "component": "resend"}
+	if m := findMetric(t, r.Metrics(), "resend_send_retries_total", base); m == nil || m.Value != 1 {
+		t.Fatalf("retries = %+v, want 1", m)
+	}
+}
+
+func TestSendDoesNotRetry422(t *testing.T) {
+	stub := &stubRoundTripper{body: `{"message":"invalid"}`, code: 422}
+	r := New(WithAPIKey("re_key"), WithFromAddress("noreply@x.io"),
+		WithHTTPClient(&http.Client{Transport: stub}))
+	if err := r.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
+	if _, err := r.Send(context.Background(), testMail("a@x.io")); err == nil {
+		t.Fatal("expected 422")
+	} else if HTTPStatus(err) != 422 {
+		t.Fatalf("HTTPStatus = %d", HTTPStatus(err))
+	}
+	if stub.calls != 1 {
+		t.Fatalf("422 must not retry, calls = %d", stub.calls)
+	}
+}
+
+func TestSendRetryHonorsCancel(t *testing.T) {
+	inner := &stubRoundTripper{
+		body:   `{"message":"rate limited"}`,
+		code:   429,
+		header: http.Header{"Retry-After": []string{"30"}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	stub := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp, err := inner.RoundTrip(r)
+		cancel()
+		return resp, err
+	})
+	r := New(WithAPIKey("re_key"), WithFromAddress("noreply@x.io"),
+		WithHTTPClient(&http.Client{Transport: stub}))
+	if err := r.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
+	if _, err := r.Send(ctx, testMail("a@x.io")); err == nil {
+		t.Fatal("expected error")
+	} else if HTTPStatus(err) != 429 {
+		t.Fatalf("HTTPStatus = %d (cancelled wait should keep first error)", HTTPStatus(err))
+	}
+	if inner.calls != 1 {
+		t.Fatalf("cancelled ctx must not retry HTTP, calls = %d", inner.calls)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestSendNetworkErrorCounter(t *testing.T) {
 	stub := &stubRoundTripper{err: errors.New("connection refused")}
@@ -353,13 +497,18 @@ func TestSendNetworkErrorCounter(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
-	if _, err := r.Send(context.Background(), &resend.SendEmailRequest{To: []string{"a@x.io"}}); err == nil {
+	if _, err := r.Send(context.Background(), testMail("a@x.io")); err == nil {
 		t.Fatal("Send should fail on network error")
+	} else if HTTPStatus(err) != 0 {
+		t.Fatalf("HTTPStatus = %d, want 0 for network", HTTPStatus(err))
 	}
 
 	network := map[string]string{"from": "noreply@x.io", "component": "resend", "error_code": "network"}
 	if m := findMetric(t, r.Metrics(), "resend_emails_failed_total", network); m == nil || m.Value != 1 {
 		t.Fatalf("failed network = %+v, want value 1", m)
+	}
+	if stub.calls != 1 {
+		t.Fatalf("network errors must not retry, calls = %d", stub.calls)
 	}
 }
 
@@ -378,7 +527,7 @@ func TestSendCountersSurviveReload(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = fw.Shutdown(context.Background()) })
 
-	if _, err := r.Send(context.Background(), &resend.SendEmailRequest{To: []string{"a@x.io"}}); err != nil {
+	if _, err := r.Send(context.Background(), testMail("a@x.io")); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -391,13 +540,12 @@ func TestSendCountersSurviveReload(t *testing.T) {
 		t.Fatalf("Reload: %v", err)
 	}
 
-	if _, err := r.Send(context.Background(), &resend.SendEmailRequest{To: []string{"a@x.io"}}); err != nil {
+	if _, err := r.Send(context.Background(), testMail("a@x.io")); err != nil {
 		t.Fatalf("Send after reload: %v", err)
 	}
 
 	// Traffic is attributed to the actual sender at send time: the first send
-	// used the pre-reload default, the second the post-reload default. No
-	// history is relabeled.
+	// used the pre-reload default, the second the post-reload default.
 	if m := findMetric(t, r.Metrics(), "resend_emails_sent_total", map[string]string{"component": "resend", "from": "a@x.io"}); m == nil || m.Value != 1 {
 		t.Fatalf("sent a@x.io = %+v, want value 1", m)
 	}
@@ -417,11 +565,11 @@ func TestSendPerSenderBucketing(t *testing.T) {
 
 	// Two sends from the default sender, one overriding From.
 	for i := 0; i < 2; i++ {
-		if _, err := r.Send(context.Background(), &resend.SendEmailRequest{To: []string{"a@x.io"}}); err != nil {
+		if _, err := r.Send(context.Background(), testMail("a@x.io")); err != nil {
 			t.Fatalf("Send: %v", err)
 		}
 	}
-	if _, err := r.Send(context.Background(), &resend.SendEmailRequest{From: "brand@x.io", To: []string{"b@x.io"}}); err != nil {
+	if _, err := r.Send(context.Background(), Mail{From: "brand@x.io", To: []string{"b@x.io"}, Text: "t"}); err != nil {
 		t.Fatalf("Send brand: %v", err)
 	}
 
@@ -449,6 +597,9 @@ func TestSendMetricsPlaceholderBeforeTraffic(t *testing.T) {
 	}
 	if m := findMetric(t, r.Metrics(), "resend_send_duration_seconds_count", base); m == nil || m.Value != 0 {
 		t.Fatalf("duration count placeholder = %+v, want value 0", m)
+	}
+	if m := findMetric(t, r.Metrics(), "resend_send_retries_total", base); m == nil || m.Value != 0 {
+		t.Fatalf("retries placeholder = %+v, want value 0", m)
 	}
 }
 
