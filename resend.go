@@ -324,7 +324,7 @@ func (c *CFResend) applyConfigFromSource() error {
 	if !ok {
 		return fmt.Errorf("cf_resend: configuration source %q not found", c.configSource)
 	}
-	c.applyConfig(*loaded)
+	c.applyConfig(loaded)
 	return nil
 }
 

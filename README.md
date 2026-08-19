@@ -4,7 +4,14 @@
 [![codecov](https://codecov.io/gh/caerus-framework/caerus-framework-resend/graph/badge.svg)](https://codecov.io/gh/caerus-framework/caerus-framework-resend)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Caerus Framework Resend Component. A thin framework wrapper around the
+Caerus Framework Resend Component.
+
+**New products should use
+[`caerus-framework-mail`](https://github.com/caerus-framework/caerus-framework-mail)**
+instead (`provider: resend` in `config/mail.json`). This module stays for
+binaries that already import `cf_resend`. Do not add features here.
+
+A thin framework wrapper around the
 [resend-go SDK](https://github.com/resend/resend-go) so components and apps can
 send email without importing the SDK directly: framework-owned lifecycle,
 configuration (file + env + flags), live config reload with last-good
